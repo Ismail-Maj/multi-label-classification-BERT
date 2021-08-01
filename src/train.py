@@ -1,11 +1,11 @@
 import argparse
+import numpy as np
 import torch
 import torch.nn as nn
 from tqdm import tqdm
-from transformers import get_cosine_schedule_with_warmup, AdamW
-from sklearn.metrics import accuracy_score, f1_score
+from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup, AdamW
 
-from utils import get_data
+from utils import get_data, get_metrics
 from model import Model
 
 
@@ -35,19 +35,21 @@ def train(args):
 
     criterion = nn.BCEWithLogitsLoss()
     optimizer = get_optimizer(model.named_parameters(), args.weight_decay, args.learning_rate)
-    scheduler = get_cosine_schedule_with_warmup(optimizer, args.warmup, len(train_loader) * args.epochs)
+    scheduler = (get_linear_schedule_with_warmup if args.scheduler == "linear" else get_cosine_schedule_with_warmup)(
+        optimizer, 0, len(train_loader) * args.epochs
+    )
 
-    for epoch in range(args.epochs):
+    for epoch in range(1, args.epochs + 1):
         for stage in ["train", "valid"]:
-            if stage == "valid" and (epoch + 1) % 10 != 0:
+            if stage == "valid" and epoch % args.validation_every != 0:
                 continue
 
             model.train() if stage == "train" else model.eval()
             torch.set_grad_enabled(stage == "train")
 
             loader = tqdm(iter(train_loader if stage == "train" else valid_loader), desc=stage)
-            preds = []
-            targets = []
+            preds = np.zeros(0, dtype=bool)
+            targets = np.zeros(0, dtype=bool)
             total_loss = 0
 
             for batch in loader:
@@ -68,23 +70,23 @@ def train(args):
                 total_loss += loss.item() * batch["input_ids"].shape[0]
 
                 pred = torch.sigmoid(logits).detach().cpu().numpy().flatten() >= 0.5
-                target = batch["target"].detach().cpu().numpy().flatten()
+                target = batch["target"].detach().cpu().numpy().flatten().astype(bool)
 
-                preds.extend(pred.tolist())
-                targets.extend(target.tolist())
+                preds = np.hstack([preds, pred])
+                targets = np.hstack([targets, target])
 
-                metrics = dict()
-                metrics["Loss"] = loss.item()
-                metrics["Hamming-Score"] = accuracy_score(target, pred)
-                metrics["F-Measure"] = f1_score(target, pred, zero_division=0)
+                metrics = {"Loss": loss.item()}
+                metrics.update(get_metrics(target, pred))
+
                 loader.set_postfix(metrics)
 
-            total_loss = total_loss / len(preds)
-
+            total_loss = total_loss / len(preds) * num_labels
+            metrics = {"Loss": total_loss}
+            metrics.update(get_metrics(targets, preds))
             print(
-                f"{epoch:03}/{args.epochs} stage:{stage} \tLoss:{total_loss:.5f} \t"
-                f"Hamming-Score:{accuracy_score(targets, preds):.5f} \t"  # works since flattened
-                f"F-Measure:{f1_score(targets, preds, zero_division=0):.5f}"  # same as unflattened F1 micro-averaging
+                " \t".join(
+                    [f"{epoch}/{args.epochs}", stage] + [f"{key}:{value:.5f}" for (key, value) in metrics.items()]
+                )
             )
         torch.save(model.state_dict(), args.model_path)
 
@@ -94,12 +96,13 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--path", type=str, default="data")
     parser.add_argument("-t", "--token-len", type=int, default=128)
     parser.add_argument("-b", "--batch-size", type=int, default=32)
-    parser.add_argument("-e", "--epochs", type=int, default=400)
+    parser.add_argument("-e", "--epochs", type=int, default=120)
+    parser.add_argument("-v", "--validation-every", type=int, default=5)
     parser.add_argument("-d", "--dropout", type=float, default=0.2)
     parser.add_argument("-l", "--learning-rate", type=float, default=5e-5)
     parser.add_argument("-w", "--weight-decay", type=float, default=1e-3)
     parser.add_argument("-m", "--model_path", type=str, default="model.pth")
-    parser.add_argument("--warmup", type=int, default=50)
+    parser.add_argument("-s", "--scheduler", type=str, default="cosine")
     parser.add_argument("--min-label-count", type=int, default=10)
     print(vars(parser.parse_args()))
     train(parser.parse_args())

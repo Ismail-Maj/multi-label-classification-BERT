@@ -1,6 +1,5 @@
 torch
 pandas
-scikit-learn
 sentencepiece
 pyarrow
 transformers
